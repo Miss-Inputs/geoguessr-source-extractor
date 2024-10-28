@@ -158,7 +158,7 @@ async def _dump_json_data(
 ):
 	futures = []
 	for path, json_dict in jsons.items():
-		module_name = path.stem.split('.', 1)[0]
+		module_name = path.stem.split('.', 1)[0].split('-', 1)[0]
 		for function_id, json_data in json_dict.items():
 			out_name = (
 				f'{function_id}.json'

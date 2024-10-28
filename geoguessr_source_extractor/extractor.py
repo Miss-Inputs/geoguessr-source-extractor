@@ -130,13 +130,14 @@ async def _dump_api_functions(
 	# Whoops!! The name of the function is actually not necessarily unique
 	for p, funcs in api_functions.items():
 		for func in funcs:
-			key = f'{func.name}: {func.method} {func.url}'
+			key = f'{func.url} ({func.method}): {func.name}'
 			if key in api_funcs_by_name:
 				api_funcs_by_name[key]['used_in'].append(abbrev_path(p, website_source_dir))
 			else:
 				api_funcs_by_name[key] = {
 					'args': func.args,
-					'body': func.body,  # TODO: Do we want to un-format that since we're dumping it to JSON? Or take the indentation/newlines out
+					#JSON would just have literal escaped tabs and newlines and that wouldn't look great
+					'body': func.body.replace('\t', ' ').replace('\n', ' '),
 					'used_in': [abbrev_path(p, website_source_dir)],
 				}
 

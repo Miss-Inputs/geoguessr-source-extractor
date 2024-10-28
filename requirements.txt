@@ -1,0 +1,8 @@
+aiofiles
+aiohttp
+jsbeautifier
+pydantic-core
+pydantic
+tqdm
+beautifulsoup4
+shapely

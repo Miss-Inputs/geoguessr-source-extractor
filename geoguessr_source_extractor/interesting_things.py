@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import re
@@ -43,7 +44,7 @@ def _unescape_and_parse_json(text: 'JSONSource', path_for_log: Any = 'This strin
 	try:
 		return pydantic_core.from_json(text)
 	except TypeError:
-		#This shouldn't happen anymore, but just in case
+		# This shouldn't happen anymore, but just in case
 		logger.exception("wat? %s isn't stringy enough for pydantic_core", path_for_log)
 		return json.loads(text)
 
@@ -121,9 +122,9 @@ class APIFunction:
 	""""get", "post", etc"""
 
 
-def parse_api_url(token: 'Token', other_tokens: Iterable['Token']) -> 'APIFunction | URL':
+def parse_api_url(text_token: 'Token', all_tokens: Iterable['Token']) -> 'APIFunction | URL':
 	method_args_start: Token = (
-		token.parent
+		text_token.parent
 	)  # d.Mb.get, or perhaps d.Mb.post, etc #type: ignore[assignment]
 	# TODO: If call, yoink the first argument instead
 	try_block_start: Token = method_args_start.parent  # type: ignore[assignment]
@@ -144,15 +145,118 @@ def parse_api_url(token: 'Token', other_tokens: Iterable['Token']) -> 'APIFuncti
 			function_name.text,
 			[
 				t.text
-				for t in other_tokens
+				for t in all_tokens
 				if t.parent == function_args_begin and t.type != 'TK_COMMA'
 			],
 			body,
-			token.text.strip('"\''),
+			text_token.text.strip('"\''),
 			method_args_start.previous.text,  # type: ignore[attr]
 		)
-	return token.text.strip('"\'')
+	return text_token.text.strip('"\'')
 	# print(describe_token(try_block_start.parent.parent))
+
+
+def get_function_id(token: 'Token'):
+	"""Attempts to get the function ID in a webpack chunk that token is part of"""
+	t = token.parent
+	while t is not None:
+		# We are looking for a line among the lines of 12345: function(a, b, c) {
+		if (
+			t.type == 'TK_START_BLOCK'
+			and t.text == '{'
+			and t.previous
+			and t.previous.type == 'TK_END_EXPR'
+			and t.previous.text == ')'
+		):
+			opener = t.previous.opened
+			if (
+				opener
+				and opener.previous.type == 'TK_RESERVED'
+				and opener.previous.text == 'function'
+			):
+				function_id_token = opener.previous.previous.previous
+				if function_id_token and function_id_token.type == 'TK_WORD':
+					with contextlib.suppress(ValueError):
+						return int(function_id_token.text)
+
+		t = t.parent
+	return None
+
+
+@dataclass
+class ArrayLiteral:
+	function_id: 'FunctionID | None'
+	variable_name: str
+	value: list[str]
+
+
+@dataclass
+class ObjectLiteral:
+	function_id: 'FunctionID | None'
+	variable_name: str
+	value: dict[str, str]
+
+
+def maybe_parse_literal(eq_token: 'Token'):
+	name_token = eq_token.previous
+	if name_token is None or name_token.type != 'TK_WORD':
+		return None
+	name = name_token.text
+	if name in {'exports', 'seo'}:
+		# nah
+		return None
+	start_token = eq_token.next
+	if start_token is None or start_token.next == start_token.closed:
+		return None
+	if start_token.type == 'TK_START_EXPR' and start_token.text == '[':
+		t = start_token.next
+		list_items = []
+		while t and t != start_token.closed:
+			# could parse int/bool literals too I guess but those would be less likely to be useful or interesting
+			if t.type == 'TK_STRING':
+				text = t.text.strip('"\'')
+				list_items.append(text)
+
+				if t.next == start_token.closed:
+					break
+				if t.next and t.next.type == 'TK_COMMA':
+					t = t.next
+			else:
+				return None
+
+			t = t.next
+		return ArrayLiteral(get_function_id(eq_token), name, list_items)
+	if start_token.type == 'TK_START_BLOCK' and start_token.text == '{':
+		t = start_token.next
+		items = {}
+		while t and t != start_token.closed:
+			if (
+				t.type in {'TK_WORD', 'TK_RESERVED'}
+				and t.next
+				and t.next.type == 'TK_OPERATOR'
+				and t.next.text == ':'
+			):
+				# object keys are probably just bare words and not strings (are they ever strings?)
+				# But we also have to check for TK_RESERVED because maybe the key is something like "do" which jsbeautifier tokenizes as the reserved word and not the normal one
+				key = t.text
+				t = t.next.next
+				# t = value token
+				if t.type == 'TK_STRING':
+					value = t.text.strip('"\'')
+					items[key] = value
+					if t.next == start_token.closed:
+						# hmm maybe my loop is wrong
+						break
+					if t.next and t.next.type == 'TK_COMMA':
+						t = t.next
+				else:
+					return None
+			else:
+				return None
+
+			t = t.next
+		return ObjectLiteral(get_function_id(eq_token), name, items)
+	return None
 
 
 @dataclass
@@ -167,6 +271,10 @@ class InterestingThings:
 	"""JSON data stored as literal argument to JSON.parse"""
 	other_urls: Collection['URL']
 	"""Other strings which are likely URLs"""
+	arrays: Collection[ArrayLiteral]
+	"""Detected array literals by function ID/name"""
+	objects: Collection[ObjectLiteral]
+	"""Detected object literals by function ID/name"""
 
 
 def _find_interesting_things_in_js(js: 'JSSource', path_for_log: Any | None = None):
@@ -179,23 +287,31 @@ def _find_interesting_things_in_js(js: 'JSSource', path_for_log: Any | None = No
 	other_urls: set[URL] = set()
 	api_functions: list[APIFunction] = []
 	jsons: dict[FunctionID, JSONData] = {}
+	arrays: list[ArrayLiteral] = []
+	objects: list[ObjectLiteral] = []
+
+	already_parsed = set()
 	for token in tokens:
+		if token in already_parsed:
+			continue
 		if token.type == 'TK_STRING':
 			text: str = token.text.strip('"\'')
 			if text.startswith(('/_next/static/', '_next/static')):
 				static_urls.add(URLPath(text.removeprefix('/')))
+				already_parsed.add(token)
 			elif text.startswith(('/_next', '_next', 'https://', 'http://', 'ftp://')):
 				other_urls.add(text.removeprefix('/'))
-
+				already_parsed.add(token)
 			if text.startswith('/api/'):
 				api = parse_api_url(token, tokens)
 				if isinstance(api, APIFunction):
 					api_functions.append(api)
 				else:
 					api_urls.add(text)
+				already_parsed.add(token)
 			# TODO: Should we detect other hardcoded strings?
 		if token.type == 'TK_WORD' and token.text == 'JSON':
-			# TODO: Maybe we should have some list of remaining tokens to parse, and take the JSON.parse argument out of that list here, so we don't bother trying to see if it's an URL
+			# TODO: Add the argument to JSON.parse and such to already_parsed
 			dot: Token = token.next  # type: ignore[assignment]
 			func_name: Token = dot.next  # type: ignore[assignment]
 			if func_name.text == 'parse':
@@ -206,8 +322,19 @@ def _find_interesting_things_in_js(js: 'JSSource', path_for_log: Any | None = No
 				except NotParseableError as e:
 					logger.debug('%s was not parseable: %s', path_for_log, e)
 				else:
+					already_parsed.add(token)
+					already_parsed.add(func_name)
 					jsons[j[0]] = j[1]
-	return InterestingThings(api_functions, api_urls, static_urls, jsons, other_urls)
+		if token.type == 'TK_EQUALS':
+			maybe_literal = maybe_parse_literal(token)
+			if isinstance(maybe_literal, ArrayLiteral):
+				arrays.append(maybe_literal)
+			if isinstance(maybe_literal, ObjectLiteral):
+				objects.append(maybe_literal)
+
+	return InterestingThings(
+		api_functions, api_urls, static_urls, jsons, other_urls, arrays, objects
+	)
 
 
 async def find_interesting_things(

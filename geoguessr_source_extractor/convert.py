@@ -54,8 +54,8 @@ SVGStr = Annotated[
 class SVGDict(pydantic.RootModel):
 	root: dict[str, SVGStr]
 
-
-RawSVGPath = Annotated[str, pydantic.StringConstraints(pattern=r'^M.+Z$')]
+#hmmmmmm
+RawSVGPath = Annotated[str, pydantic.StringConstraints(pattern=r'^M\d.+\dZ?$')]
 
 
 class RawSVGDict(pydantic.RootModel):
@@ -147,10 +147,16 @@ async def convert_file(path: Path, out_dir: Path):
 		data = ConvertableDictAdapter.validate_json(content)
 	except pydantic.ValidationError:
 		# Just want to see what it looks like, not necessarily the whole thing
-		raw = pydantic_core.from_json(content)
-		if isinstance(raw, dict):
-			raw = raw.popitem()
-		logger.info('Could not convert %s, unknown type: %s', path, raw)
+		try:
+			raw = pydantic_core.from_json(content)
+			if isinstance(raw, dict):
+				raw = raw.popitem()
+				if isinstance(raw[0], str) and isinstance(raw[1], str):
+					#not really anything special/interesting
+					return
+			logger.info('Could not convert %s, unknown type: %s', path, raw)
+		except ValueError:
+			logger.info('Could not convert %s, not even JSON: %s', path, content)
 		return
 
 	if isinstance(data, PolygonCoordinatesDict):

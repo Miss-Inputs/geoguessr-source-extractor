@@ -16,7 +16,13 @@ from tqdm.auto import tqdm
 from .app import parse_localizations_from_app
 from .convert import convert_all_files
 from .download_source import DiscoveredFiles, download_source
-from .interesting_things import APIFunction, InterestingThings, find_interesting_things
+from .interesting_things import (
+	APIFunction,
+	ArrayLiteral,
+	InterestingThings,
+	ObjectLiteral,
+	find_interesting_things,
+)
 from .utils import (
 	abbrev_path,
 	deltree_if_exists,
@@ -41,6 +47,8 @@ class InterestingThingsInAllFiles:
 	other_api_urls: dict[Path, Collection['URL']] = field(default_factory=dict)
 	jsons: dict[Path, Mapping['FunctionID', 'JSONData']] = field(default_factory=dict)
 	other_urls: dict[Path, Collection['URL']] = field(default_factory=dict)
+	arrays: dict[Path, Collection[ArrayLiteral]] = field(default_factory=dict)
+	objects: dict[Path, Collection[ObjectLiteral]] = field(default_factory=dict)
 
 	def combine(self, path: Path, things: InterestingThings):
 		if things.static_urls:
@@ -53,6 +61,10 @@ class InterestingThingsInAllFiles:
 			self.jsons[path] = things.jsons
 		if things.other_urls:
 			self.other_urls[path] = things.other_urls
+		if things.arrays:
+			self.arrays[path] = things.arrays
+		if things.objects:
+			self.objects[path] = things.objects
 
 
 async def _find_interesting_things_in_file(file: Path, root_dir: Path):
@@ -136,7 +148,7 @@ async def _dump_api_functions(
 			else:
 				api_funcs_by_name[key] = {
 					'args': func.args,
-					#JSON would just have literal escaped tabs and newlines and that wouldn't look great
+					# JSON would just have literal escaped tabs and newlines and that wouldn't look great
 					'body': func.body.replace('\t', ' ').replace('\n', ' '),
 					'used_in': [abbrev_path(p, website_source_dir)],
 				}
@@ -151,6 +163,17 @@ async def _dump_static_urls(static_urls: Mapping[str, Collection[str]], out_dir:
 	)
 
 
+def get_module_name(path: Path):
+	if path.parent.name == 'chunks':
+		return path.stem.split('.', 1)[0].split('-', 1)[0]
+	if any(p.name == 'pages' and p.parent.name == 'chunks' for p in path.parents):
+		parent_names = [p.name for p in path.parents]
+		parent_names = parent_names[: parent_names.index('chunks')]
+		base_name = path.stem.rsplit('-', 1)[0]
+		return ' '.join(reversed(parent_names)) + f' {base_name}'
+	return path.stem
+
+
 async def _dump_json_data(
 	jsons: Mapping[Path, Mapping['FunctionID', 'JSONData']],
 	localized_data: Mapping[tuple['ModuleID', 'FunctionID'], PurePosixPath] | None,
@@ -158,7 +181,7 @@ async def _dump_json_data(
 ):
 	futures = []
 	for path, json_dict in jsons.items():
-		module_name = path.stem.split('.', 1)[0].split('-', 1)[0]
+		module_name = get_module_name(path)
 		for function_id, json_data in json_dict.items():
 			out_name = (
 				f'{function_id}.json'
@@ -176,7 +199,49 @@ async def _dump_json_data(
 		await result
 
 
-async def extract_source(
+async def _dump_arrays_objects(
+	arrays: Mapping[Path, Collection[ArrayLiteral]],
+	objects: Mapping[Path, Collection[ObjectLiteral]],
+	out_dir: Path,
+):
+	futures = []
+	array_filenames = set()
+	object_filenames = set()
+	for path, objs in arrays.items():
+		module_name = get_module_name(path)
+		for obj in objs:
+			out_base_name = (
+				f'{module_name} {obj.function_id}'
+				if obj.function_id and str(obj.function_id) != module_name
+				else module_name
+			)
+			out_name = f'{out_base_name} ({obj.variable_name})'
+			# avoid writing to the same file twice concurrently
+			while out_name in array_filenames:
+				out_name += '_'
+			array_filenames.add(out_name)
+			out_path = out_dir / 'Arrays' / f'{out_name}.json'
+			futures.append(write_json(out_path, obj.value))
+	for path, objs in objects.items():
+		module_name = get_module_name(path)
+		for obj in objs:
+			out_base_name = (
+				f'{module_name} {obj.function_id}'
+				if obj.function_id and str(obj.function_id) != module_name
+				else module_name
+			)
+			out_name = f'{out_base_name} ({obj.variable_name})'
+			while out_name in object_filenames:
+				out_name += '_'
+			object_filenames.add(out_name)
+			out_path = out_dir / 'Objects' / f'{out_name}.json'
+			futures.append(write_json(out_path, obj.value))
+
+	for result in asyncio.as_completed(futures):
+		await result
+
+
+async def extract_things_from_source(
 	extracted_data_dir: Path,
 	website_source_dir: Path,
 	downloaded_paths: Iterable[Path],
@@ -202,7 +267,7 @@ async def extract_source(
 		abbrev_path(p, website_source_dir): [str(p) for p in v]
 		for p, v in interesting_things.static_urls.items()
 	}
-	for result in asyncio.as_completed(
+	for result in tqdm.as_completed(
 		(
 			_dump_api_functions(
 				interesting_things.api_functions, website_source_dir, extracted_data_dir
@@ -229,7 +294,11 @@ async def extract_source(
 				),
 				sort_keys=True,
 			),
-		)
+			_dump_arrays_objects(
+				interesting_things.arrays, interesting_things.objects, extracted_data_dir
+			),
+		),
+		desc='Dumping',
 	):
 		await result
 
@@ -295,7 +364,7 @@ async def download_and_extract(
 			downloaded_paths = frozenset(website_source_dir.rglob('*'))
 			app_path = None
 
-		await extract_source(
+		await extract_things_from_source(
 			extracted_data_dir,
 			website_source_dir,
 			downloaded_paths,
@@ -305,4 +374,7 @@ async def download_and_extract(
 			force_redownload_static_files=force_redownload_static_files,
 		)
 
-	await convert_all_files(extracted_data_dir.glob('JSONs/*.json'), extracted_data_dir)
+	await convert_all_files(
+		(*extracted_data_dir.glob('JSONs/*.json'), *extracted_data_dir.glob('Objects/*.json')),
+		extracted_data_dir,
+	)
